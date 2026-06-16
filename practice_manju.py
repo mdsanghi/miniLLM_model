@@ -10,11 +10,9 @@ class MaskedMultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
-
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x):
