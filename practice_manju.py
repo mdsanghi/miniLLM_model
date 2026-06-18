@@ -5,277 +5,207 @@ import random
 import tiktoken
 import torch.nn.functional as F
 
-# Tokenization
+# 1. Tokenization Setup
 with open("./data/tiny_corpus.txt", "r", encoding="utf8") as f:
     text = f.read()
 
-print(text[:150])
-print("Total characters:", len(text))
-
 tokenizer = tiktoken.encoding_for_model("gpt-4o")
-
 data = tokenizer.encode(text)
 
 split_idx = int(0.9 * len(data))
 train_data = data[:split_idx]
 val_data = data[split_idx:]
 
-print("Train tokens:", len(train_data))
-print("Validation tokens:", len(val_data))
-
-
 block_size = 16
+
 def get_batch(data, batch_size):
     indices = [random.randint(0, len(data) - block_size - 1) for _ in range(batch_size)]
     x = [data[i:i + block_size] for i in indices]
     y = [data[i + 1:i + block_size + 1] for i in indices]
+    return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
-    x = torch.tensor(x, dtype=torch.long)
-    y = torch.tensor(y, dtype=torch.long)
 
-    return x, y
+# 2. Rotary Position Embedding (RoPE) Helper Functions
+def precompute_theta_pos_frequencies(head_dim, seq_len, device, theta=10000.0):
+    # head_dim must be even
+    assert head_dim % 2 == 0
+    dim_idx = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (theta ** (dim_idx / head_dim))
+    
+    # Generate positions framework
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    
+    # Cache cos and sin values
+    return torch.cos(freqs), torch.sin(freqs)
 
-x, y = get_batch(train_data, batch_size=4)
-print("Input:", x)
-print("Target:", y)
+def apply_rotary_emb(x, cos, sin):
+    # x shape: (b, num_heads, seq_len, head_dim)
+    # cos, sin shape: (seq_len, head_dim // 2) -> reshape for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(1) # (1, 1, seq_len, head_dim // 2)
+    sin = sin.unsqueeze(0).unsqueeze(1) # (1, 1, seq_len, head_dim // 2)
+    
+    # Split x into even and odd components
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    
+    # Apply rotation matrix transformation
+    x_rot1 = x1 * cos - x2 * sin
+    x_rot2 = x1 * sin + x2 * cos
+    
+    # Recombine components back together
+    x_out = torch.stack([x_rot1, x_rot2], dim=-1).flatten(-2)
+    return x_out
 
-# Masked multi head attention
-  
-class MaskedMultiHeadAttention(nn.Module):
+
+# 3. Masked Multi-Head Attention with RoPE
+class RoPEMaskedMultiHeadAttention(nn.Module):
 
     def __init__(self, d_model, num_heads):
         super().__init__()
-
-        assert d_model % num_heads == 0, \
-            "d_model must be divisible by num_heads"
-
+        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
 
-        # QKV projections
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # Final projection
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-    def forward(self, x):
-
+        
+        # Max upper bound for generation steps context tracking
+        max_positions = 2048
+        self.register_buffer(
+            "mask", 
+            torch.triu(torch.ones(max_positions, max_positions), diagonal=1).bool(),
+            persistent=False
+        )
+            
+    def forward(self, x, cos, sin):
         b, seq_len, _ = x.shape
 
-        # Project to Q, K, V
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+        Q = self.q_proj(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Split into heads
-        Q = Q.view(b, seq_len, self.num_heads, self.head_dim)
-        K = K.view(b, seq_len, self.num_heads, self.head_dim)
-        V = V.view(b, seq_len, self.num_heads, self.head_dim)
+        # Apply RoPE embeddings right after projections to Q and K
+        Q = apply_rotary_emb(Q, cos, sin)
+        K = apply_rotary_emb(K, cos, sin)
 
-        # Move heads before seq_len (b, num_heads, seq_len, head_dim)
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
+        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        mask_slice = self.mask[:seq_len, :seq_len]
+        scores = scores.masked_fill(mask_slice, float('-inf'))
 
-        # Attention scores
-        scores = Q @ K.transpose(-2, -1)
-        scores = scores / (self.head_dim ** 0.5)
-
-        # Causal mask
-        mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device),
-            diagonal=1
-        ).bool()
-
-        scores = scores.masked_fill(mask, float('-inf'))
-
-        # Attention probabilities
         attn_weights = torch.softmax(scores, dim=-1)
+        context = (attn_weights @ V).transpose(1, 2).contiguous().view(b, seq_len, self.d_model)
+        
+        return self.out_proj(context)
 
-        # Context vectors
-        context = attn_weights @ V
 
-        # Combine heads
-        # (b, num_heads, seq_len, head_dim)
-        # ->
-        # (b, seq_len, num_heads, head_dim)
-
-        context = context.transpose(1, 2).contiguous()
-
-        # Merge heads
-        context = context.view(b, seq_len, self.d_model)
-
-        # Final projection
-        output = self.out_proj(context)
-
-        return output
-# Fedd forward class
-class FeedForward(nn.Module):
-    def __init__(self, d_model, hidden_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim), # Linear layer
-            nn.GELU(),  # Activation function Modern GPTs use GELU
-            nn.Linear(hidden_dim, d_model), # Second linear layer
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-# Transformer Block    
+# 4. Block and Core Architecture Adjustments
 class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, hidden_dim):
         super().__init__()
-
-        self.attention = MaskedMultiHeadAttention(embed_dim, num_heads)
+        self.attention = RoPEMaskedMultiHeadAttention(embed_dim, num_heads)
         self.norm1 = nn.LayerNorm(embed_dim) 
-        self.ffn = FeedForward(embed_dim, hidden_dim) 
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, embed_dim)
+        )
         self.norm2 = nn.LayerNorm(embed_dim) 
 
-    def forward(self, x):
-
-        norm_x = self.norm1(x) # Layer normalization
-        attention_output = self.attention(norm_x)  #  Multi-head causal self attention 
-        x = x + attention_output # Residual connections
-        norm_x = self.norm2(x) # Layer normalization
-        ffn_output = self.ffn(norm_x) # Feedforward neural network 
-        x = x + ffn_output # Residual connections
-    
+    def forward(self, x, cos, sin):
+        x = x + self.attention(self.norm1(x), cos, sin) 
+        x = x + self.ffn(self.norm2(x)) 
         return x
-    
-# Mini GPT class
-# Token embeddings
-# Positional embeddings
-# Transformer blocks
-# Residual connections
-# Layer normalization
-# Output projection layer
 
 class MiniGPT(nn.Module):
-
-    def __init__(self, vocab_size, block_size, embed_dim, num_heads, hidden_dim, num_layers):
+    def __init__(self, vocab_size, embed_dim, num_heads, hidden_dim, num_layers):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.position_embedding = nn.Embedding(block_size, embed_dim)
-        self.blocks = nn.Sequential(*[
+        self.head_dim = embed_dim // num_heads
+        
+        self.layers = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, hidden_dim)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(embed_dim)
         self.lm_head = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x):
-        
+    def forward(self, x, position_ids=None):
         b, seq_len = x.shape
-        token_embeddings = self.token_embedding(x)
-        positions = torch.arange(seq_len, device=x.device)
-        position_embeddings = self.position_embedding(positions)
-        x = token_embeddings + position_embeddings
-        x = self.blocks(x)
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        x = self.token_embedding(x)
+        
+        # If no explicit position ids are given (e.g. training), assume default sequential indexing
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
+            
+        # Dynamically calculate RoPE sine/cosine frequencies based on explicit position indexes passed
+        # Fetching max value from position_ids to know bounds
+        max_pos = position_ids.max().item() + 1
+        cos_cached, sin_cached = precompute_theta_pos_frequencies(self.head_dim, int(max_pos), x.device)
+        
+        # Index into frequencies using given absolute position IDs
+        cos = cos_cached[position_ids].squeeze(0) # Drops batch dimension helper mapping 
+        sin = sin_cached[position_ids].squeeze(0)
+        
+        for layer in self.layers:
+            x = layer(x, cos, sin)
+            
+        return self.lm_head(self.final_norm(x))
 
-        return logits
 
-# Model Architecture
-
+# 5. Initialization
+device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(123)
 
 model = MiniGPT(
-    vocab_size=tokenizer.n_vocab,
-    block_size=block_size,
-    embed_dim=32,
-    num_heads=4,
-    hidden_dim=128,
-    num_layers=4
-)
+    vocab_size=tokenizer.n_vocab, embed_dim=32, num_heads=4, hidden_dim=128, num_layers=4
+).to(device)
 
-print(model)
+optimizer = optim.AdamW(model.parameters(), lr=3e-4)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
-
-learning_rate = 3e-4
-batch_size = 32
-max_steps = 5000
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
+# 6. Training Loop Execution
 model.train()
+for step in range(1000): # Shortened iterations for demonstration convenience
+    x_batch, y_batch = get_batch(train_data, batch_size=32)
+    x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
-for step in range(max_steps):
-
-    # Get batch
-    x, y = get_batch(train_data, batch_size=batch_size)
-    x = x.to(device)
-    y = y.to(device)
-
-    logits = model(x)
-
-    # Reshape for cross entropy
+    logits = model(x_batch) # position_ids default handled inside forward automatically
     B, T, C = logits.shape
-
-    loss = F.cross_entropy(
-        logits.view(B * T, C),
-        y.view(B * T)
-    )
+    loss = F.cross_entropy(logits.view(B * T, C), y_batch.view(B * T))
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    # Print progress
-    if step % 200 == 0:
-        print(f"Step {step}, Loss: {loss.item():.4f}")
-        
-# Generator
 
-def generate(model, tokenizer, prompt, max_new_tokens=50):
-
+# 7. Updated Generator supporting Absolute Tracker Constraints
+def generate_with_rope(model, tokenizer, prompt, max_new_tokens=50, temperature=1.0):
     model.eval()
-    device = next(model.parameters()).device
     tokens = tokenizer.encode(prompt)
-    x = torch.tensor(tokens, dtype=torch.long, device=device)
-    x = x.unsqueeze(0)
+    x_gen = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
 
     with torch.no_grad():
-
         for _ in range(max_new_tokens):
-
-            x_cond = x[:, -block_size:]
-            logits = model(x_cond)
-            logits = logits[:, -1, :]
+            curr_seq_len = x_gen.shape[1]
+            
+            # Slicing the input to follow your block window constraints
+            start_idx = max(0, curr_seq_len - block_size)
+            x_cond = x_gen[:, start_idx:]
+            
+            # CRITICAL FOR ROPE: Build explicit tracking vectors mapping back 
+            # to their true original structural placement positions.
+            position_ids = torch.arange(start_idx, curr_seq_len, device=device).unsqueeze(0)
+            
+            logits = model(x_cond, position_ids=position_ids)
+            logits = logits[:, -1, :] / temperature
             probs = torch.softmax(logits, dim=-1)
-            next_token = torch.argmax(probs, dim=-1, keepdim=True)
-            x = torch.cat([x, next_token], dim=1)
+            
+            next_token = torch.multinomial(probs, num_samples=1)
+            x_gen = torch.cat([x_gen, next_token], dim=1)
 
-    output_tokens = x[0].tolist()
-    generated_text = tokenizer.decode(output_tokens)
+    return tokenizer.decode(x_gen[0].tolist())
 
-    return generated_text
-
-prompt = "The two men"
-
-generated = generate(
-    model,
-    tokenizer,
-    prompt,
-    max_new_tokens=15
-)
-
-print(generated)
-
-prompt = "The two men"
-
-generated = generate(
-    model,
-    tokenizer,
-    prompt,
-    max_new_tokens=50
-)
-print(generated)
-
-
+# Test Generation with RoPE
+print(generate_with_rope(model, tokenizer, "The two men", max_new_tokens=20))
