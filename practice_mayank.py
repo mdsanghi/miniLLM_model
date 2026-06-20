@@ -4,9 +4,24 @@ import torch.optim as optim
 import random
 import tiktoken
 import torch.nn.functional as F
+from datasets import load_dataset
 
-with open("./data/tiny_corpus.txt", "r", encoding="utf8") as f:
-    text = f.read()
+TRIVIAQA_CONFIG = "rc.nocontext"
+TRIVIAQA_SPLIT = "train"
+MAX_TRIVIAQA_EXAMPLES = 2000
+
+
+def format_triviaqa_example(example):
+    answer = example["answer"]
+    aliases = answer.get("aliases") or []
+    answer_text = aliases[0] if aliases else answer.get("value", "")
+
+    return f"Question: {example['question']}\nAnswer: {answer_text}\n\n"
+
+
+dataset = load_dataset("trivia_qa", TRIVIAQA_CONFIG, split=TRIVIAQA_SPLIT)
+dataset = dataset.select(range(min(MAX_TRIVIAQA_EXAMPLES, len(dataset))))
+text = "".join(format_triviaqa_example(example) for example in dataset)
 
 print(text[:150])
 print("Total characters:", len(text))
