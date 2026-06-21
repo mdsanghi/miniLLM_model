@@ -1,6 +1,7 @@
 from PIL import Image, ImageDraw, ImageFont, features
 import os
 import math
+import zipfile
 
 try:
     import arabic_reshaper
@@ -77,6 +78,8 @@ else:
 
 def create_loader(language, steps):
     gif_path = f"vertical_step_loader_{language}.gif"
+    png_path = f"vertical_step_loader_{language}_100_percent.png"
+    zip_path = f"{gif_path}.zip"
 
     left_x = 100
     top_y = 110
@@ -96,12 +99,7 @@ def create_loader(language, steps):
 
     positions = [(icon_x, top_y + i * gap) for i in range(len(steps))]
 
-    frames = []
-
-    for frame_index in range(frames_n):
-        t = frame_index / (frames_n - 1)
-        completed_float = t * len(steps)
-
+    def create_loader_image(completed_float, frame_index=0):
         img_big = Image.new("RGBA", (SW, SH), white_bg)
         draw = ImageDraw.Draw(img_big)
 
@@ -195,7 +193,17 @@ def create_loader(language, steps):
                 **text_options
             )
 
-        frames.append(img.convert("RGB"))
+        return img.convert("RGB")
+
+    frames = []
+
+    for frame_index in range(frames_n):
+        t = frame_index / (frames_n - 1)
+        completed_float = t * len(steps)
+        frames.append(create_loader_image(completed_float, frame_index))
+
+    png_image = create_loader_image(len(steps))
+    png_image.save(png_path)
 
     frames[0].save(
         gif_path,
@@ -206,13 +214,19 @@ def create_loader(language, steps):
         optimize=False
     )
 
-    return gif_path
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(gif_path, arcname=os.path.basename(gif_path))
+        z.write(png_path, arcname=os.path.basename(png_path))
+
+    return gif_path, png_path, zip_path
 
 
 for language, steps in language_sets.items():
-    gif_file = create_loader(language, steps)
+    gif_file, png_file, zip_file = create_loader(language, steps)
 
     print(f"Created: {gif_file}")
+    print(f"Created: {png_file}")
+    print(f"Created: {zip_file}")
 
 if not ARABIC_SUPPORT:
     print("For correct Arabic rendering, install:")

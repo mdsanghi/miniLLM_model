@@ -4,6 +4,7 @@ import os
 
 gif_path = "loading_indicator_white_bg.gif"
 zip_path = "loading_indicator_white_bg.zip"
+png_path = "loading_indicator_100_percent_white_bg.png"
 
 W = H = 500
 SCALE = 4
@@ -34,10 +35,7 @@ stroke = 20 * SCALE
 
 frames = []
 
-for i in range(frames_n):
-    t = i / (frames_n - 1)
-    percent = int(round(98 * t))
-
+def create_progress_image(percent):
     img = Image.new("RGBA", (SW, SH), white_bg)
     draw = ImageDraw.Draw(img)
 
@@ -85,7 +83,16 @@ for i in range(frames_n):
     )
 
     img = img.resize((W, H), Image.Resampling.LANCZOS)
-    frames.append(img.convert("RGB"))
+    return img.convert("RGB")
+
+
+for i in range(frames_n):
+    t = i / (frames_n - 1)
+    percent = int(round(98 * t))
+    frames.append(create_progress_image(percent))
+
+png_image = create_progress_image(100)
+png_image.save(png_path)
 
 frames[0].save(
     gif_path,
@@ -98,6 +105,8 @@ frames[0].save(
 
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(gif_path, arcname=os.path.basename(gif_path))
+    z.write(png_path, arcname=os.path.basename(png_path))
 
 print("GIF created:", gif_path)
+print("PNG created:", png_path)
 print("ZIP created:", zip_path)
